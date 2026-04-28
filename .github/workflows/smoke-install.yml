@@ -9,6 +9,7 @@ on:
     paths:
       - install.sh
       - install.ps1
+      - installers/**
       - Formula/cave.rb
       - scripts/build-binaries.sh
       - scripts/update-homebrew.sh
@@ -39,6 +40,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+
+      - name: Run installers/test-install.sh (unit test for the installer script)
+        if: matrix.triple != 'windows-x64'
+        shell: bash
+        run: bash installers/test-install.sh
 
       - name: Build host tarball
         shell: bash

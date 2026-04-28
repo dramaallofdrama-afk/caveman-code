@@ -40,6 +40,22 @@ jobs:
       - name: Build binaries
         run: ./scripts/build-binaries.sh
 
+      - name: Generate SHA256SUMS for release artifacts
+        # WS11: installers/install.sh verifies tarball checksums against this
+        # file. Generated from inside the binaries dir so paths are flat.
+        run: |
+          cd packages/coding-agent/binaries
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum cave-darwin-arm64.tar.gz cave-darwin-x64.tar.gz \
+                     cave-linux-x64.tar.gz cave-linux-arm64.tar.gz \
+                     cave-windows-x64.zip > SHA256SUMS
+          else
+            shasum -a 256 cave-darwin-arm64.tar.gz cave-darwin-x64.tar.gz \
+                          cave-linux-x64.tar.gz cave-linux-arm64.tar.gz \
+                          cave-windows-x64.zip > SHA256SUMS
+          fi
+          cat SHA256SUMS
+
       - name: Extract changelog for this version
         id: changelog
         run: |
@@ -63,6 +79,7 @@ jobs:
             cave-linux-x64.tar.gz \
             cave-linux-arm64.tar.gz \
             cave-windows-x64.zip \
+            SHA256SUMS \
             2>/dev/null || \
           gh release upload "${RELEASE_TAG}" \
             cave-darwin-arm64.tar.gz \
@@ -70,6 +87,7 @@ jobs:
             cave-linux-x64.tar.gz \
             cave-linux-arm64.tar.gz \
             cave-windows-x64.zip \
+            SHA256SUMS \
             --clobber
 
       - name: Upload artifacts for downstream jobs

@@ -30,6 +30,15 @@ export type {
 	OAuthProviderInfo,
 	OAuthProviderInterface,
 } from "./utils/oauth/types.js";
+// WS11: cave login dispatcher needs the OAuth provider registry helpers.
+export {
+	getOAuthProvider,
+	getOAuthProviders,
+	getOAuthProviderInfoList,
+	registerOAuthProvider,
+	resetOAuthProviders,
+	unregisterOAuthProvider,
+} from "./utils/oauth/index.js";
 export type {
 	CachePolicy,
 	CacheUsageReport,

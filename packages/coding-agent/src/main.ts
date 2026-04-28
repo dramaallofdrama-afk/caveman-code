@@ -11,10 +11,13 @@ import { type ImageContent, modelsAreEqual, supportsXhigh } from "@cave/ai";
 import { detectTerminalIdentity, ProcessTerminal, probeTerminal, setKeybindings, TUI } from "@cave/tui";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
+import { runDoctor } from "./cli/doctor.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
 import { listModels } from "./cli/list-models.js";
+import { runLogin } from "./cli/login.js";
 import { selectSession } from "./cli/session-picker.js";
+import { maybeNotifyUpdateAvailable, runSelfUpdate } from "./cli/update.js";
 import { getAgentDir, getModelsPath, VERSION } from "./config.js";
 import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.js";
 import {
@@ -44,6 +47,7 @@ import { runMigrations, showDeprecationWarnings } from "./migrations.js";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { initTheme, setDetectedBackground, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
+import { runOnboarding, shouldRunOnboarding } from "./onboarding/wizard.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
 import { isLocalPath } from "./utils/paths.js";
 
@@ -483,6 +487,22 @@ export async function main(args: string[]) {
 		process.env.PI_SKIP_VERSION_CHECK = "1";
 	}
 
+	// WS11: lightweight subcommands that don't need a session.
+	// `doctor`, `self-update`, and `login` are read-only or auth-only commands
+	// that should boot fast (≤200ms) and never load the agent runtime.
+	if (args[0] === "doctor") {
+		const code = await runDoctor(args.slice(1));
+		process.exit(code);
+	}
+	if (args[0] === "self-update" || args[0] === "selfupdate") {
+		const code = await runSelfUpdate(args.slice(1));
+		process.exit(code);
+	}
+	if (args[0] === "login") {
+		const code = await runLogin(args.slice(1));
+		process.exit(code);
+	}
+
 	if (await handlePackageCommand(args)) {
 		return;
 	}
@@ -547,6 +567,30 @@ export async function main(args: string[]) {
 	const agentDir = getAgentDir();
 	const startupSettingsManager = SettingsManager.create(cwd, agentDir);
 	reportDiagnostics(collectSettingsDiagnostics(startupSettingsManager, "startup session lookup"));
+
+	// WS11: First-run wizard — only in interactive mode, only when stdin is a TTY,
+	// only when the user hasn't completed it before. Bounded to ≤5s on the happy
+	// path because we ask at most 4 questions and never load any heavy modules.
+	if (appMode === "interactive" && shouldRunOnboarding(startupSettingsManager)) {
+		try {
+			await runOnboarding(startupSettingsManager);
+		} catch (err) {
+			// Don't block startup if the wizard fails — log and continue.
+			const msg = err instanceof Error ? err.message : String(err);
+			console.error(chalk.yellow(`Warning: onboarding wizard failed: ${msg}`));
+		}
+	}
+
+	// WS11: Background once-per-24h update check. Never blocks startup.
+	if (appMode === "interactive" && !offlineMode) {
+		void maybeNotifyUpdateAvailable(startupSettingsManager).then((newer) => {
+			if (newer) {
+				console.error(
+					chalk.dim(`(cave ${newer} is available — run \`cave self-update\` to upgrade)`),
+				);
+			}
+		});
+	}
 
 	// Decide the final runtime cwd before creating cwd-bound runtime services.
 	// --session and --resume may select a session from another project, so project-local
