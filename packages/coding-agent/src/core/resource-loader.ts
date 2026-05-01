@@ -114,6 +114,20 @@ function loadProjectContextFiles(
 
 	contextFiles.push(...ancestorContextFiles);
 
+	// WS7: project-local memory index. Mirrors the layout `FilesProvider` and
+	// `composeStartupPrelude` use (`<cwd>/.cave/memory/MEMORY.md`). Routing it
+	// through the same pipe as CLAUDE.md gives the LLM a hand-curated, cache-
+	// stable view of long-lived facts without any special-case prompt assembly.
+	const memoryIndex = join(resolvedCwd, ".cave", "memory", "MEMORY.md");
+	if (!seenPaths.has(memoryIndex) && existsSync(memoryIndex)) {
+		try {
+			contextFiles.push({ path: memoryIndex, content: readFileSync(memoryIndex, "utf-8") });
+			seenPaths.add(memoryIndex);
+		} catch (error) {
+			console.error(chalk.yellow(`Warning: Could not read ${memoryIndex}: ${error}`));
+		}
+	}
+
 	return contextFiles;
 }
 

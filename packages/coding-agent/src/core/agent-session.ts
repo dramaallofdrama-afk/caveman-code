@@ -16,10 +16,11 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import type { Agent, AgentEvent, AgentMessage, AgentState, AgentTool, ThinkingLevel } from "@cave/agent";
-import { checkpoints, LLMLinguaMiddleware } from "@cave/agent";
+import { checkpoints, LLMLinguaMiddleware, memory as memoryNs } from "@cave/agent";
 
 const { CheckpointManager } = checkpoints;
 type CheckpointManagerInstance = InstanceType<typeof CheckpointManager>;
+type MemoryProviderInstance = memoryNs.MemoryProvider;
 
 import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@cave/ai";
 import { ENV_VAR_BY_PROVIDER, isContextOverflow, modelsAreEqual, resetApiProviders, supportsXhigh } from "@cave/ai";
@@ -88,7 +89,10 @@ import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
+import { createMemorySaveToolDefinition, createMemorySearchToolDefinition } from "./tools/memory.js";
 import { createToolDefinitionFromAgentTool, wrapToolDefinition } from "./tools/tool-definition-wrapper.js";
+import { resolveMemoryProvider } from "./memory-factory.js";
+import { composeStartupPrelude } from "./memory-bridge.js";
 
 // ============================================================================
 // Skill Block Parsing
@@ -289,6 +293,13 @@ export class AgentSession {
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
 	private _baseToolsOverride?: Record<string, AgentTool>;
+	// Resolves when the constructor's _buildRuntime() finishes wiring tools and
+	// extensions. prompt() awaits this so print-mode callers (and child cave
+	// subagents, which always run in print mode) don't ship the first turn with
+	// agent.state.tools = []. Without this gate, subagents like `explore` reply
+	// "I don't have access to the repository contents" because the LLM never
+	// receives the read/grep/find/ls tool defs on turn 1.
+	private _initialRuntimeReady!: Promise<void>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
@@ -326,6 +337,16 @@ export class AgentSession {
 	private _repomapCache: { hash: string; rendered: string } | undefined;
 	private _repomapBuildPromise: Promise<void> | undefined;
 
+	// WS7: cavemem-backed retrieval state.
+	private _memoryProvider: MemoryProviderInstance | undefined;
+	private _memoryProviderInit: Promise<MemoryProviderInstance | undefined> | undefined;
+	private _memoryEnabled = true;
+	private _memoryRecallCache: { hash: string; rendered: string } | undefined;
+	private _memoryRecallBuildPromise: Promise<void> | undefined;
+	private _memoryPreludeInjected = false;
+	private _memoryRecallTimeoutMs = 1000;
+	private _memoryRecallTokenCap = 800;
+
 	// Gap 2: chat mode for plan ↔ edit gating. "auto" = no gating (default).
 	// Honor `CAVE_CHAT_MODE` env (set by parent task tool's per-call mode override).
 	private _chatMode: ChatMode =
@@ -359,10 +380,26 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 
-		void this._buildRuntime({
+		this._initialRuntimeReady = this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		// Don't let an unhandled rejection crash the process before prompt()
+		// awaits it; the rejection still surfaces to whoever awaits whenReady.
+		this._initialRuntimeReady.catch(() => undefined);
+	}
+
+	/**
+	 * Resolves when the constructor's initial runtime build (tool wiring,
+	 * extension setup, base system prompt) has completed. Callers that issue
+	 * `prompt()` immediately after construction — e.g. print mode and any
+	 * subagent spawned via the `task` tool — should await this first.
+	 *
+	 * `prompt()` itself awaits this internally, so most callers don't need to
+	 * wait explicitly.
+	 */
+	get whenReady(): Promise<void> {
+		return this._initialRuntimeReady;
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -557,10 +594,16 @@ export class AgentSession {
 			};
 		};
 
-		// Gap 1 + Gap 7: chain repomap injection with soft compression.
+		// Gap 1 + Gap 7 + WS7: chain memory recall + repomap injection (parallel),
+		// then soft compression. Memory and repomap hit different backends so we
+		// run them concurrently and merge the two injections before compaction.
 		this.agent.transformContext = async (messages) => {
-			const afterRepomap = await this._buildRepomapTransform(messages);
-			return this._softCompactTransform(afterRepomap);
+			const [afterMemory, afterRepomap] = await Promise.all([
+				this._buildMemoryTransform(messages),
+				this._buildRepomapTransform(messages),
+			]);
+			const merged = this._mergeRetrievalInjections(messages, afterMemory, afterRepomap);
+			return this._softCompactTransform(merged);
 		};
 
 		// Gap 2 + Gap 8: chat-mode tool gating + plan-mode system-prompt banner.
@@ -755,6 +798,285 @@ export class AgentSession {
 			}
 		}
 		return [...messages, repomapMessage];
+	}
+
+	// =========================================================================
+	// Memory recall auto-injection (WS7)
+	// =========================================================================
+
+	/** Toggle memory recall and write hooks for this session. */
+	setMemoryEnabled(enabled: boolean): void {
+		this._memoryEnabled = enabled;
+		if (!enabled) this._memoryRecallCache = undefined;
+	}
+
+	get memoryEnabled(): boolean {
+		return this._memoryEnabled;
+	}
+
+	/**
+	 * Resolve (and lazily build) the active memory provider. Cavemem when its
+	 * CLI is on $PATH; FilesProvider over `<cwd>/.cave/memory/` otherwise.
+	 *
+	 * Returns the same instance the `/memory` slash command should use so the
+	 * MCP transport, embedding model, and FTS handles are reused.
+	 */
+	async memoryProvider(): Promise<MemoryProviderInstance | undefined> {
+		if (this._memoryProvider) return this._memoryProvider;
+		if (!this._memoryProviderInit) {
+			this._memoryProviderInit = resolveMemoryProvider({ cwd: this._cwd })
+				.then((p) => {
+					this._memoryProvider = p;
+					return p;
+				})
+				.catch((err) => {
+					console.warn(
+						`[cave/memory] provider init failed: ${err instanceof Error ? err.message : String(err)}`,
+					);
+					return undefined;
+				});
+		}
+		return this._memoryProviderInit;
+	}
+
+	private _latestUserText(messages: AgentMessage[]): string {
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const m = messages[i];
+			if (m.role !== "user") continue;
+			if (Array.isArray(m.content)) {
+				return m.content
+					.filter((c): c is { type: "text"; text: string } => c.type === "text")
+					.map((c) => c.text)
+					.join("\n");
+			}
+			if (typeof m.content === "string") return m.content;
+			return "";
+		}
+		return "";
+	}
+
+	/** Build the search query from chat-state + last user message. */
+	private _memoryQuery(messages: AgentMessage[]): string {
+		const text = this._latestUserText(messages).slice(0, 500);
+		const fileNames = [...this._repomapAddedFiles, ...this._repomapMentionedFiles]
+			.slice(-5)
+			.map((p) => basename(p));
+		return [text, ...fileNames].filter((s) => s && s.length > 0).join("  ").trim();
+	}
+
+	private _memoryHash(query: string): string {
+		// Cache the rendered recall keyed by query — same input ⇒ skip provider call.
+		const trimmed = query.replace(/\s+/g, " ").trim();
+		return trimmed.length > 256 ? trimmed.slice(0, 256) : trimmed;
+	}
+
+	private async _withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+		return new Promise<T>((resolve) => {
+			let settled = false;
+			const timer = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				resolve(fallback);
+			}, ms);
+			promise
+				.then((v) => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					resolve(v);
+				})
+				.catch(() => {
+					if (settled) return;
+					settled = true;
+					clearTimeout(timer);
+					resolve(fallback);
+				});
+		});
+	}
+
+	private async _renderMemoryRecall(provider: MemoryProviderInstance, query: string): Promise<string | undefined> {
+		const hits = await this._withTimeout(provider.search(query, { limit: 5 }), this._memoryRecallTimeoutMs, []);
+		if (!hits || hits.length === 0) return undefined;
+		const ids = hits.map((h) => h.id).filter((id) => Number.isFinite(id) && id >= 0);
+		let bodies: memoryNs.MemoryObservation[] = [];
+		if (ids.length > 0) {
+			bodies = await this._withTimeout(provider.getObservations(ids, { expand: false }), this._memoryRecallTimeoutMs, []);
+		}
+		const byId = new Map(bodies.map((b) => [b.id, b]));
+		const rows = hits
+			.map((h) => {
+				const body = byId.get(h.id);
+				const preview = (body?.content ?? h.preview ?? "").replace(/\s+/g, " ").trim().slice(0, 320);
+				const kind = body?.kind ?? h.kind ?? "fact";
+				const ts = body?.ts ?? h.ts ?? "";
+				return `- #${h.id} [${kind}]${ts ? ` ${ts}` : ""} — ${preview}`;
+			})
+			.filter((r) => r.includes("—"));
+		if (rows.length === 0) return undefined;
+		return rows.join("\n");
+	}
+
+	private async _getOrBuildMemoryRecall(query: string): Promise<string | undefined> {
+		if (!query) return undefined;
+		const provider = await this.memoryProvider();
+		if (!provider) return undefined;
+		const available = await this._withTimeout(provider.isAvailable(), 500, false);
+		if (!available) return undefined;
+
+		const hash = this._memoryHash(query);
+		if (this._memoryRecallCache?.hash === hash) return this._memoryRecallCache.rendered;
+
+		if (this._memoryRecallBuildPromise) {
+			await this._memoryRecallBuildPromise;
+			if (this._memoryRecallCache?.hash === hash) return this._memoryRecallCache.rendered;
+		}
+
+		const buildPromise = (async () => {
+			try {
+				const rendered = await this._renderMemoryRecall(provider, query);
+				if (rendered) {
+					this._memoryRecallCache = { hash, rendered };
+				} else {
+					this._memoryRecallCache = { hash, rendered: "" };
+				}
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				console.warn(`[cave/memory] recall failed: ${message}`);
+				this._memoryRecallCache = { hash, rendered: "" };
+			}
+		})();
+		this._memoryRecallBuildPromise = buildPromise;
+		try {
+			await buildPromise;
+		} finally {
+			this._memoryRecallBuildPromise = undefined;
+		}
+		return this._memoryRecallCache?.rendered || undefined;
+	}
+
+	/**
+	 * Build the per-turn memory recall transform. Returns the message array
+	 * with a single `customType: "memory-recall"` entry inserted before the
+	 * latest user message when the active provider returns hits, otherwise
+	 * the input unchanged.
+	 *
+	 * Parallel with `_buildRepomapTransform` — both seed off the same chat-state.
+	 * Failures degrade silently: timeouts, missing provider, empty results all
+	 * return `messages` untouched.
+	 */
+	private async _buildMemoryTransform(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		if (!this._memoryEnabled) return messages;
+
+		const query = this._memoryQuery(messages);
+		const rendered = await this._getOrBuildMemoryRecall(query);
+		const blocks: AgentMessage[] = [];
+
+		// First-turn prelude: project-local MEMORY.md + a kickoff cavemem search
+		// seeded by the cwd basename. Wires memory-bridge.composeStartupPrelude
+		// which has been dead code since WS7 landed.
+		if (!this._memoryPreludeInjected) {
+			this._memoryPreludeInjected = true;
+			const prelude = await this._buildSessionPrelude();
+			if (prelude) {
+				blocks.push({
+					role: "custom",
+					customType: "memory-prelude",
+					content: prelude,
+					display: false,
+					timestamp: Date.now(),
+				});
+			}
+		}
+
+		if (rendered) {
+			blocks.push({
+				role: "custom",
+				customType: "memory-recall",
+				content: `<memory-recall>\nTop hits from prior cave sessions and saved facts. Search seeded by current chat-state (no extra LLM call).\n\n${rendered}\n</memory-recall>`,
+				display: false,
+				timestamp: Date.now(),
+			});
+		}
+
+		if (blocks.length === 0) return messages;
+
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === "user") {
+				return [...messages.slice(0, i), ...blocks, ...messages.slice(i)];
+			}
+		}
+		return [...messages, ...blocks];
+	}
+
+	private async _buildSessionPrelude(): Promise<string | undefined> {
+		try {
+			const indexPath = join(this._cwd, ".cave", "memory", "MEMORY.md");
+			let memoryIndex: string | undefined;
+			if (existsSync(indexPath)) {
+				const raw = readFileSync(indexPath, "utf-8");
+				memoryIndex = raw.split("\n").slice(0, 200).join("\n");
+			}
+			let cavememSnippet: string | undefined;
+			const provider = await this.memoryProvider();
+			if (provider) {
+				const hits = await this._withTimeout(
+					provider.search(basename(this._cwd), { limit: 5 }),
+					this._memoryRecallTimeoutMs,
+					[] as memoryNs.MemoryHit[],
+				);
+				if (hits.length > 0) {
+					cavememSnippet = memoryNs.formatPrelude(hits);
+				}
+			}
+			return composeStartupPrelude({ memoryIndex, cavememSnippet });
+		} catch (err) {
+			console.warn(`[cave/memory] prelude failed: ${err instanceof Error ? err.message : String(err)}`);
+			return undefined;
+		}
+	}
+
+	/**
+	 * Merge two retrieval transforms (memory + repomap) into one message list.
+	 *
+	 * Each transform either returns `messages` unchanged or `messages` with a
+	 * single `customType` block inserted immediately before the latest user
+	 * message. We diff each result against `original` to extract just the
+	 * inserted blocks, drop memory if the combined token estimate exceeds
+	 * 25 % of the model context window, then re-insert in order
+	 * (memory first, then repomap, both before the user message).
+	 */
+	private _mergeRetrievalInjections(
+		original: AgentMessage[],
+		afterMemory: AgentMessage[],
+		afterRepomap: AgentMessage[],
+	): AgentMessage[] {
+		const memoryBlocks = afterMemory.length > original.length ? afterMemory.slice(0, afterMemory.length - original.length).filter((m) => !original.includes(m)) : [];
+		const repomapBlocks = afterRepomap.length > original.length ? afterRepomap.slice(0, afterRepomap.length - original.length).filter((m) => !original.includes(m)) : [];
+
+		// Token-budget enforcement: drop memory blocks first when memory + repomap
+		// together exceed 25% of the context window. Repomap is structural and
+		// cheaper to keep round-trip; memory is the tunable knob.
+		const contextWindow = this.model?.contextWindow ?? 0;
+		let keptMemory = memoryBlocks;
+		if (contextWindow > 0 && memoryBlocks.length > 0) {
+			const memTokens = estimateContextTokens(memoryBlocks).tokens;
+			const mapTokens = estimateContextTokens(repomapBlocks).tokens;
+			if (memTokens > this._memoryRecallTokenCap) {
+				keptMemory = [];
+			} else if ((memTokens + mapTokens) / contextWindow > 0.25) {
+				keptMemory = [];
+			}
+		}
+
+		const inserts = [...keptMemory, ...repomapBlocks];
+		if (inserts.length === 0) return original;
+
+		for (let i = original.length - 1; i >= 0; i--) {
+			if (original[i].role === "user") {
+				return [...original.slice(0, i), ...inserts, ...original.slice(i)];
+			}
+		}
+		return [...original, ...inserts];
 	}
 
 	// =========================================================================
@@ -1394,6 +1716,12 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		// Wait for the constructor's initial runtime build before processing
+		// the first prompt. Without this, callers that send a message
+		// immediately after `new AgentSession()` (print mode, child cave
+		// subagents) ship turn 1 with agent.state.tools = [] and the LLM
+		// reports it has no access to read/grep/etc. tools.
+		await this._initialRuntimeReady;
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 
 		// Handle extension commands first (execute immediately, even during streaming)
@@ -2887,6 +3215,31 @@ export class AgentSession {
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
 		);
 
+		// WS7: register memory_search / memory_save when a provider is reachable.
+		// Cached factory means cavemem (or FilesProvider fallback) is built once
+		// and shared with the `/memory` slash command + the recall transform.
+		try {
+			const memoryProvider = await resolveMemoryProvider({ cwd: this._cwd });
+			this._memoryProvider = memoryProvider;
+			const available = await memoryProvider.isAvailable().catch(() => false);
+			// Always register; the tools themselves short-circuit when unavailable.
+			// FilesProvider is always available, so this never strips them locally.
+			if (available || memoryProvider.id === "files") {
+				this._baseToolDefinitions.set(
+					"memory_search",
+					createMemorySearchToolDefinition(memoryProvider) as unknown as ToolDefinition,
+				);
+				this._baseToolDefinitions.set(
+					"memory_save",
+					createMemorySaveToolDefinition(memoryProvider) as unknown as ToolDefinition,
+				);
+			}
+		} catch (err) {
+			console.warn(
+				`[cave/memory] tool registration skipped: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		}
+
 		const extensionsResult = this._resourceLoader.getExtensions();
 		if (options.flagValues) {
 			for (const [name, value] of options.flagValues) {
@@ -2924,7 +3277,16 @@ export class AgentSession {
 
 		const defaultActiveToolNames = this._baseToolsOverride
 			? Object.keys(this._baseToolsOverride)
-			: ["read", "bash", "edit", "write", "task", "agent"];
+			: [
+					"read",
+					"bash",
+					"edit",
+					"write",
+					"task",
+					"agent",
+					...(this._baseToolDefinitions.has("memory_search") ? ["memory_search"] : []),
+					...(this._baseToolDefinitions.has("memory_save") ? ["memory_save"] : []),
+				];
 		const requestedActive = options.activeToolNames ?? defaultActiveToolNames;
 		this._refreshToolRegistry({
 			activeToolNames: requestedActive,

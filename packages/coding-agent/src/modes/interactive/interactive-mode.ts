@@ -214,6 +214,14 @@ export class InteractiveMode {
 	private version: string;
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
+	/**
+	 * FIFO of user-submitted prompts that arrived between turns of the main
+	 * input loop (i.e. while `onInputCallback` was undefined because
+	 * `session.prompt(...)` was still being awaited). Drained by
+	 * `getUserInput()` before re-arming the callback so messages cannot be
+	 * silently dropped.
+	 */
+	private pendingInputQueue: string[] = [];
 	private loadingAnimation: Loader | undefined = undefined;
 	private pendingWorkingMessage: string | undefined = undefined;
 	private readonly defaultWorkingMessage = "Working...";
@@ -2470,6 +2478,12 @@ export class InteractiveMode {
 
 			if (this.onInputCallback) {
 				this.onInputCallback(text);
+			} else {
+				// Main loop is between turns (last session.prompt() returned
+				// but getUserInput() has not re-armed onInputCallback yet).
+				// Queue so the message is consumed on the next loop tick
+				// instead of being silently dropped.
+				this.pendingInputQueue.push(text);
 			}
 			this.editor.addToHistory?.(text);
 		};
@@ -3069,6 +3083,12 @@ export class InteractiveMode {
 	}
 
 	async getUserInput(): Promise<string> {
+		// Drain any input that arrived while the main loop was busy awaiting
+		// the previous prompt. Without this, submissions made between
+		// session.prompt() resolving and the next getUserInput() await would
+		// be silently dropped (onInputCallback is undefined in that window).
+		const queued = this.pendingInputQueue.shift();
+		if (queued !== undefined) return queued;
 		return new Promise((resolve) => {
 			this.onInputCallback = (text: string) => {
 				this.onInputCallback = undefined;
@@ -4418,14 +4438,23 @@ export class InteractiveMode {
 	}
 
 	private async handleMemorySlashCommand(text: string): Promise<void> {
-		const { memory: memoryNs } = await import("@cave/agent");
 		const { runMemorySlashCommand } = await import("../../core/slash-commands.js");
 		try {
-			const provider = new memoryNs.CavememProvider();
+			// Reuse the AgentSession's MemoryProvider so MCP transport, embedding
+			// model, and FTS handles are shared with the auto-injection transform.
+			const provider = await this.session.memoryProvider();
+			if (!provider) {
+				this.appendSlashOutput(
+					`Memory backend unavailable. Install \`cavemem\` or initialise \`.cave/memory/\`.`,
+					true,
+				);
+				return;
+			}
 			const result = await runMemorySlashCommand(text, {
 				cwd: this.sessionManager.getCwd(),
 				provider,
-				enabled: true,
+				enabled: this.session.memoryEnabled,
+				setEnabled: (next) => this.session.setMemoryEnabled(next),
 			});
 			this.appendSlashOutput(result.lines.join("\n"), result.errors > 0);
 		} catch (err) {
@@ -4486,6 +4515,16 @@ export class InteractiveMode {
 		});
 		this.appendSlashOutput(result.output, result.exitCode !== 0);
 		this._refreshChatModeFooter();
+		if (result.promptToSend) {
+			const text = result.promptToSend;
+			this.editor.addToHistory?.(`/plan ${text}`);
+			void this.session
+				.prompt(text, this.session.isStreaming ? { streamingBehavior: "steer" } : undefined)
+				.catch((err: unknown) => {
+					const msg = err instanceof Error ? err.message : String(err);
+					this.showError(msg);
+				});
+		}
 	}
 
 	private handleActSlashCommand(args: string): void {
